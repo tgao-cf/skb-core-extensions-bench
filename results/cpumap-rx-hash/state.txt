@@ -1,0 +1,27 @@
+## receiver
+7.4.0-rc1-skbext-v1-rxcsum+ #1 SMP PREEMPT_DYNAMIC Mon Nov  9 19:23:49 CST 2026
+CPU(s):                                  256
+Model name:                              AMD EPYC 9755 128-Core Processor
+Thread(s) per core:                      2
+CPU(s) scaling MHz:                      60%
+NUMA node(s):                            16
+driver: ice
+version: 7.4.0-rc1-skbext-v1-rxcsum+
+firmware-version: 4.91 0x800214b2 1.3909.0
+Ethernet controller: Intel Corporation Ethernet Controller E810-XXV for SFP (rev 02)
+numa_node 12 rx_cpu 98 cpumap_cpu 100 app_cpus 102
+ro console=tty0 console=ttyS0,115200n8 iommu=pt cgroup.memory=nosocket panic=10
+governor performance boost 1
+irqbalance inactive
+rx-checksumming: on
+generic-receive-offload: on
+rx-vlan-offload: on
+receive-hashing: on
+RX:			2048
+TX:			256
+rx-usecs:	50
+## sender
+6.18.59-mainline-xdptx #1 SMP PREEMPT_DYNAMIC Tue Oct 27 16:46:33 CDT 2026
+Model name:                              AMD EPYC 9684X 96-Core Processor
+driver: mlx5_core
+firmware-version: 26.39.2048 (MT_0000000546)

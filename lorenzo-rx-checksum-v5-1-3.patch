@@ -1,0 +1,394 @@
+From 470fd7509917f9de5b07760c8d7267e03cf09168 Mon Sep 17 00:00:00 2001
+From: Lorenzo Bianconi <lorenzo@kernel.org>
+Date: Wed, 15 Jul 2026 23:39:41 +0200
+Subject: [PATCH] Lorenzo Bianconi's RX checksum kfunc series v5, patches 1-3,
+ for the bench
+
+Patches 1-3 of "[PATCH bpf-next v5 0/8] Add the the capability to load HW
+RX checksum in eBPF programs" (Message-Id
+20260715-bpf-xdp-meta-rxcksum-v5-0-623d5c0d0ab7@kernel.org), squashed:
+bpf_xdp_metadata_rx_checksum(), the veth and the ice callbacks. The copy
+of enum xdp_checksum in patch 1 is dropped, because the skb core
+extensions series already defines it.
+---
+ Documentation/netlink/specs/netdev.yaml       |   5 +
+ Documentation/networking/xdp-rx-metadata.rst  |   3 +
+ drivers/net/ethernet/intel/ice/ice_txrx_lib.c | 123 ++++++++++++------
+ drivers/net/veth.c                            |  32 +++++
+ include/net/xdp.h                             |   7 +
+ include/uapi/linux/netdev.h                   |   3 +
+ net/core/xdp.c                                |  32 +++++
+ tools/include/uapi/linux/netdev.h             |   3 +
+ 8 files changed, 166 insertions(+), 42 deletions(-)
+
+diff --git a/Documentation/netlink/specs/netdev.yaml b/Documentation/netlink/specs/netdev.yaml
+index 7d1b3e2f8a0d..a9ce17699ec1 100644
+--- a/Documentation/netlink/specs/netdev.yaml
++++ b/Documentation/netlink/specs/netdev.yaml
+@@ -77,6 +77,11 @@ definitions:
+         doc: |
+           Device is capable of exposing receive packet VLAN tag via
+           bpf_xdp_metadata_rx_vlan_tag().
++      -
++        name: checksum
++        doc: |
++          Device is capable of exposing receive checksum result via
++          bpf_xdp_metadata_rx_checksum().
+   -
+     type: flags
+     name: xsk-flags
+diff --git a/Documentation/networking/xdp-rx-metadata.rst b/Documentation/networking/xdp-rx-metadata.rst
+index 4d1306298f12..ccd33a0e59ea 100644
+--- a/Documentation/networking/xdp-rx-metadata.rst
++++ b/Documentation/networking/xdp-rx-metadata.rst
+@@ -28,6 +28,9 @@ metadata is supported, this set will grow:
+ .. kernel-doc:: net/core/xdp.c
+    :identifiers: bpf_xdp_metadata_rx_vlan_tag
+ 
++.. kernel-doc:: net/core/xdp.c
++   :identifiers: bpf_xdp_metadata_rx_checksum
++
+ An XDP program can use these kfuncs to read the metadata into stack
+ variables for its own consumption. Or, to pass the metadata on to other
+ consumers, an XDP program can store it into the metadata area carried
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+index 85439853596f..0f2ea9f7d6a9 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+@@ -78,69 +78,48 @@ ice_rx_hash_to_skb(const struct ice_rx_ring *rx_ring,
+ 		libeth_rx_pt_set_hash(skb, hash, decoded);
+ }
+ 
+-/**
+- * ice_rx_gcs - Set generic checksum in skb
+- * @skb: skb currently being received and modified
+- * @rx_desc: receive descriptor
+- */
+-static void ice_rx_gcs(struct sk_buff *skb,
+-		       const union ice_32b_rx_flex_desc *rx_desc)
+-{
+-	const struct ice_32b_rx_flex_desc_nic *desc;
+-	u16 csum;
+-
+-	desc = (struct ice_32b_rx_flex_desc_nic *)rx_desc;
+-	skb->ip_summed = CHECKSUM_COMPLETE;
+-	csum = (__force u16)desc->raw_csum;
+-	skb->csum = csum_unfold((__force __sum16)swab16(csum));
+-}
+-
+-/**
+- * ice_rx_csum - Indicate in skb if checksum is good
+- * @ring: the ring we care about
+- * @skb: skb currently being received and modified
+- * @rx_desc: the receive descriptor
+- * @ptype: the packet type decoded by hardware
+- *
+- * skb->protocol must be set before this function is called
+- */
+ static void
+-ice_rx_csum(struct ice_rx_ring *ring, struct sk_buff *skb,
+-	    union ice_32b_rx_flex_desc *rx_desc, u16 ptype)
++ice_get_rx_csum(const union ice_32b_rx_flex_desc *rx_desc, u16 ptype,
++		struct ice_rx_ring *ring, enum xdp_checksum *ip_summed,
++		u32 *cksum, u8 *cksum_level)
+ {
+-	struct libeth_rx_pt decoded;
++	struct libeth_rx_pt decoded = libie_rx_pt_parse(ptype);
+ 	u16 rx_status0, rx_status1;
+ 	bool ipv4, ipv6;
+ 
+-	/* Start with CHECKSUM_NONE and by default csum_level = 0 */
+-	skb->ip_summed = CHECKSUM_NONE;
+-
+-	decoded = libie_rx_pt_parse(ptype);
+ 	if (!libeth_rx_pt_has_checksum(ring->netdev, decoded))
+-		return;
++		goto checksum_none;
+ 
+ 	rx_status0 = le16_to_cpu(rx_desc->wb.status_error0);
+ 	rx_status1 = le16_to_cpu(rx_desc->wb.status_error1);
+-
+ 	if ((ring->flags & ICE_RX_FLAGS_RING_GCS) &&
+ 	    rx_desc->wb.rxdid == ICE_RXDID_FLEX_NIC &&
+ 	    (decoded.inner_prot == LIBETH_RX_PT_INNER_TCP ||
+ 	     decoded.inner_prot == LIBETH_RX_PT_INNER_UDP ||
+ 	     decoded.inner_prot == LIBETH_RX_PT_INNER_ICMP)) {
+-		ice_rx_gcs(skb, rx_desc);
++		const struct ice_32b_rx_flex_desc_nic *desc;
++		__wsum wcsum;
++		u16 csum;
++
++		desc = (struct ice_32b_rx_flex_desc_nic *)rx_desc;
++		*ip_summed = XDP_CHECKSUM_COMPLETE;
++		csum = (__force u16)desc->raw_csum;
++		wcsum = csum_unfold((__force __sum16)swab16(csum));
++		*cksum = (__force u32)wcsum;
++		*cksum_level = 0;
+ 		return;
+ 	}
+ 
+ 	/* check if HW has decoded the packet and checksum */
+ 	if (!(rx_status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_L3L4P_S)))
+-		return;
++		goto checksum_none;
+ 
+ 	ipv4 = libeth_rx_pt_get_ip_ver(decoded) == LIBETH_RX_PT_OUTER_IPV4;
+ 	ipv6 = libeth_rx_pt_get_ip_ver(decoded) == LIBETH_RX_PT_OUTER_IPV6;
+ 
+ 	if (ipv4 && (rx_status0 & (BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_EIPE_S)))) {
+ 		ring->vsi->back->hw_rx_eipe_error++;
+-		return;
++		goto checksum_none;
+ 	}
+ 
+ 	if (ipv4 && (rx_status0 & (BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S))))
+@@ -164,14 +143,51 @@ ice_rx_csum(struct ice_rx_ring *ring, struct sk_buff *skb,
+ 	 * we need to bump the checksum level by 1 to reflect the fact that
+ 	 * we are indicating we validated the inner checksum.
+ 	 */
+-	if (decoded.tunnel_type >= LIBETH_RX_PT_TUNNEL_IP_GRENAT)
+-		skb->csum_level = 1;
+-
+-	skb->ip_summed = CHECKSUM_UNNECESSARY;
++	*cksum_level = decoded.tunnel_type >= LIBETH_RX_PT_TUNNEL_IP_GRENAT;
++	*ip_summed = XDP_CHECKSUM_UNNECESSARY;
++	*cksum = 0;
+ 	return;
+ 
+ checksum_fail:
+ 	ring->vsi->back->hw_csum_rx_error++;
++checksum_none:
++	*ip_summed = XDP_CHECKSUM_NONE;
++	*cksum_level = 0;
++	*cksum = 0;
++}
++
++/**
++ * ice_rx_csum - Indicate in skb if checksum is good
++ * @ring: the ring we care about
++ * @skb: skb currently being received and modified
++ * @rx_desc: the receive descriptor
++ * @ptype: the packet type decoded by hardware
++ *
++ * skb->protocol must be set before this function is called
++ */
++static void
++ice_rx_csum(struct ice_rx_ring *ring, struct sk_buff *skb,
++	    union ice_32b_rx_flex_desc *rx_desc, u16 ptype)
++{
++	enum xdp_checksum ip_summed;
++	u8 cksum_level;
++	u32 cksum;
++
++	ice_get_rx_csum(rx_desc, ptype, ring, &ip_summed, &cksum,
++			&cksum_level);
++	switch (ip_summed) {
++	case XDP_CHECKSUM_UNNECESSARY:
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		skb->csum_level = cksum_level;
++		break;
++	case XDP_CHECKSUM_COMPLETE:
++		skb->ip_summed = CHECKSUM_COMPLETE;
++		skb->csum = (__force __wsum)cksum;
++		break;
++	default:
++		skb->ip_summed = CHECKSUM_NONE;
++		break;
++	}
+ }
+ 
+ /**
+@@ -571,6 +587,28 @@ static int ice_xdp_rx_hash(const struct xdp_md *ctx, u32 *hash,
+ 	return 0;
+ }
+ 
++/**
++ * ice_xdp_rx_checksum - RX checksum XDP hint handler
++ * @ctx: XDP buff pointer
++ * @ip_summed: RX checksum result destination address
++ * @cksum: RX checksum value destination address
++ * @cksum_level: RX checksum level value destination address
++ */
++static int ice_xdp_rx_checksum(const struct xdp_md *ctx,
++			       enum xdp_checksum *ip_summed,
++			       u32 *cksum, u8 *cksum_level)
++{
++	const struct libeth_xdp_buff *xdp_ext = (void *)ctx;
++	const union ice_32b_rx_flex_desc *rx_desc = xdp_ext->desc;
++	struct ice_rx_ring *ring;
++
++	ring = libeth_xdp_buff_to_rq(xdp_ext, typeof(*ring), xdp_rxq);
++	ice_get_rx_csum(rx_desc, ice_get_ptype(rx_desc), ring, ip_summed,
++			cksum, cksum_level);
++
++	return 0;
++}
++
+ /**
+  * ice_xdp_rx_vlan_tag - VLAN tag XDP hint handler
+  * @ctx: XDP buff pointer
+@@ -603,4 +641,5 @@ const struct xdp_metadata_ops ice_xdp_md_ops = {
+ 	.xmo_rx_timestamp		= ice_xdp_rx_hw_ts,
+ 	.xmo_rx_hash			= ice_xdp_rx_hash,
+ 	.xmo_rx_vlan_tag		= ice_xdp_rx_vlan_tag,
++	.xmo_rx_checksum		= ice_xdp_rx_checksum,
+ };
+diff --git a/drivers/net/veth.c b/drivers/net/veth.c
+index b402f8ed5096..34e8b2eb12e9 100644
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@ -1715,6 +1715,37 @@ static int veth_xdp_rx_vlan_tag(const struct xdp_md *ctx, __be16 *vlan_proto,
+ 	return err;
+ }
+ 
++static int veth_xdp_rx_checksum(const struct xdp_md *ctx,
++				enum xdp_checksum *ip_summed,
++				u32 *cksum, u8 *cksum_level)
++{
++	const struct veth_xdp_buff *_ctx = (void *)ctx;
++	const struct sk_buff *skb = _ctx->skb;
++
++	if (!skb)
++		return -ENODATA;
++
++	switch (skb->ip_summed) {
++	case CHECKSUM_COMPLETE:
++		*ip_summed = XDP_CHECKSUM_COMPLETE;
++		*cksum = skb->csum;
++		*cksum_level = 0;
++		break;
++	case CHECKSUM_UNNECESSARY:
++		*ip_summed = XDP_CHECKSUM_UNNECESSARY;
++		*cksum_level = skb->csum_level;
++		*cksum = 0;
++		break;
++	default:
++		*ip_summed = XDP_CHECKSUM_NONE;
++		*cksum_level = 0;
++		*cksum = 0;
++		break;
++	}
++
++	return 0;
++}
++
+ static const struct net_device_ops veth_netdev_ops = {
+ 	.ndo_init            = veth_dev_init,
+ 	.ndo_open            = veth_open,
+@@ -1740,6 +1771,7 @@ static const struct xdp_metadata_ops veth_xdp_metadata_ops = {
+ 	.xmo_rx_timestamp		= veth_xdp_rx_timestamp,
+ 	.xmo_rx_hash			= veth_xdp_rx_hash,
+ 	.xmo_rx_vlan_tag		= veth_xdp_rx_vlan_tag,
++	.xmo_rx_checksum		= veth_xdp_rx_checksum,
+ };
+ 
+ #define VETH_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HW_CSUM | \
+diff --git a/include/net/xdp.h b/include/net/xdp.h
+index f44c4c3ccd64..118da5e56c0b 100644
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -645,6 +645,10 @@ void xdp_attachment_setup(struct xdp_attachment_info *info,
+ 			   NETDEV_XDP_RX_METADATA_VLAN_TAG, \
+ 			   bpf_xdp_metadata_rx_vlan_tag, \
+ 			   xmo_rx_vlan_tag) \
++	XDP_METADATA_KFUNC(XDP_METADATA_KFUNC_RX_CHECKSUM, \
++			   NETDEV_XDP_RX_METADATA_CHECKSUM, \
++			   bpf_xdp_metadata_rx_checksum, \
++			   xmo_rx_checksum)
+ 
+ enum xdp_rx_metadata {
+ #define XDP_METADATA_KFUNC(name, _, __, ___) name,
+@@ -721,6 +725,9 @@ struct xdp_metadata_ops {
+ 			       enum xdp_rss_hash_type *rss_type);
+ 	int	(*xmo_rx_vlan_tag)(const struct xdp_md *ctx, __be16 *vlan_proto,
+ 				   u16 *vlan_tci);
++	int	(*xmo_rx_checksum)(const struct xdp_md *ctx,
++				   enum xdp_checksum *ip_summed,
++				   u32 *cksum, u8 *cksum_level);
+ };
+ 
+ #ifdef CONFIG_NET
+diff --git a/include/uapi/linux/netdev.h b/include/uapi/linux/netdev.h
+index 9398de2648e7..fa3e06eda08d 100644
+--- a/include/uapi/linux/netdev.h
++++ b/include/uapi/linux/netdev.h
+@@ -53,11 +53,14 @@ enum netdev_xdp_act {
+  *   hash via bpf_xdp_metadata_rx_hash().
+  * @NETDEV_XDP_RX_METADATA_VLAN_TAG: Device is capable of exposing receive
+  *   packet VLAN tag via bpf_xdp_metadata_rx_vlan_tag().
++ * @NETDEV_XDP_RX_METADATA_CHECKSUM: Device is capable of exposing receive
++ *   checksum result via bpf_xdp_metadata_rx_checksum().
+  */
+ enum netdev_xdp_rx_metadata {
+ 	NETDEV_XDP_RX_METADATA_TIMESTAMP = 1,
+ 	NETDEV_XDP_RX_METADATA_HASH = 2,
+ 	NETDEV_XDP_RX_METADATA_VLAN_TAG = 4,
++	NETDEV_XDP_RX_METADATA_CHECKSUM = 8,
+ };
+ 
+ /**
+diff --git a/net/core/xdp.c b/net/core/xdp.c
+index baab9acb88c9..0cbc7440d8b4 100644
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -964,6 +964,38 @@ __bpf_kfunc int bpf_xdp_metadata_rx_vlan_tag(const struct xdp_md *ctx,
+ 	return -EOPNOTSUPP;
+ }
+ 
++/**
++ * bpf_xdp_metadata_rx_checksum - Read XDP frame RX checksum.
++ * @ctx: XDP context pointer.
++ * @ip_summed: Return value pointer to a bitmask indicating available checksums.
++ * @cksum: Return value pointer indicating the hw checksum value.
++ * @cksum_level: Return value pointer indicating the checksum level result.
++ *
++ * In case of success, ``ip_summed`` is set to the RX checksum result. Possible
++ * values are:
++ * ``XDP_CHECKSUM_NONE``
++ * ``XDP_CHECKSUM_UNNECESSARY``
++ * ``XDP_CHECKSUM_COMPLETE``
++ * ``XDP_CHECKSUM_COMPLETE`` | ``XDP_CHECKSUM_UNNECESSARY``
++ *
++ * In case of success, ``cksum`` contains the checksum value calculated by the
++ * NIC. ``cksum`` is valid only if ``XDP_CHECKSUM_COMPLETE`` is set in
++ * ``ip_summed``. ``cksum_level`` contains the checksum level reported by the
++ * hw. ``cksum_level`` can be considered valid only if
++ * ``XDP_CHECKSUM_UNNECESSARY`` is set in ``ip_summed``.
++ *
++ * Return:
++ * * Returns 0 on success or ``-errno`` on error.
++ * * ``-EOPNOTSUPP`` : means device driver does not implement kfunc
++ * * ``-ENODATA``    : means no RX-checksum available for this frame
++ */
++__bpf_kfunc int bpf_xdp_metadata_rx_checksum(const struct xdp_md *ctx,
++					     enum xdp_checksum *ip_summed,
++					     u32 *cksum, u8 *cksum_level)
++{
++	return -EOPNOTSUPP;
++}
++
+ __bpf_kfunc_end_defs();
+ 
+ BTF_KFUNCS_START(xdp_metadata_kfunc_ids)
+diff --git a/tools/include/uapi/linux/netdev.h b/tools/include/uapi/linux/netdev.h
+index 9398de2648e7..fa3e06eda08d 100644
+--- a/tools/include/uapi/linux/netdev.h
++++ b/tools/include/uapi/linux/netdev.h
+@@ -53,11 +53,14 @@ enum netdev_xdp_act {
+  *   hash via bpf_xdp_metadata_rx_hash().
+  * @NETDEV_XDP_RX_METADATA_VLAN_TAG: Device is capable of exposing receive
+  *   packet VLAN tag via bpf_xdp_metadata_rx_vlan_tag().
++ * @NETDEV_XDP_RX_METADATA_CHECKSUM: Device is capable of exposing receive
++ *   checksum result via bpf_xdp_metadata_rx_checksum().
+  */
+ enum netdev_xdp_rx_metadata {
+ 	NETDEV_XDP_RX_METADATA_TIMESTAMP = 1,
+ 	NETDEV_XDP_RX_METADATA_HASH = 2,
+ 	NETDEV_XDP_RX_METADATA_VLAN_TAG = 4,
++	NETDEV_XDP_RX_METADATA_CHECKSUM = 8,
+ };
+ 
+ /**
+-- 
+2.56.0
+
